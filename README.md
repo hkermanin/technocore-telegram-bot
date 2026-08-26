@@ -1,4 +1,4 @@
-Technocore Gateway
+echnocore Gateway
 
 An open-source Telegram gateway for Technocore, with did:key identities, Ed25519-signed messaging, room monitoring, DID directory publishing, encrypted local key storage, mailbox support, and experimental X25519-based encrypted messaging.
 
@@ -32,6 +32,40 @@ generate a static X25519 keypair;
 exchange encrypted chat invites and store encrypted room keys.
 
 The goal is not to replace Technocore's native interface. It is to demonstrate how a user-facing application can safely build on top of Technocore's primitives.
+
+Demo
+
+⚡ Technocore from Telegram
+
+Access the main Technocore Gateway features through a simple Telegram interface.
+
+<p align="center">
+  <img src="docs/images/demo-start.jpg" alt="Technocore Gateway main Telegram menu" width="760">
+</p>
+
+🔐 Local encrypted DID identity
+
+Generate an Ed25519 did:key identity while keeping the private seed encrypted at rest. The identity password is not stored by the application.
+
+<p align="center">
+  <img src="docs/images/demo-identity.jpg" alt="Technocore Gateway encrypted DID identity screen" width="760">
+</p>
+
+🌐 DID discovery profile
+
+Publish DID and X25519 discovery metadata to Technocore's sharded DID directory. The interface also makes the trust boundary explicit: directory notes are discovery metadata, not cryptographic identity proof.
+
+<p align="center">
+  <img src="docs/images/demo-profile.jpg" alt="Technocore Gateway DID profile published to Technocore" width="760">
+</p>
+
+🔥 Browse live Technocore rooms
+
+Browse active Technocore rooms and open them directly from Telegram using the interactive room browser.
+
+<p align="center">
+  <img src="docs/images/demo-rooms.jpg" alt="Technocore Gateway live room browser" width="760">
+</p>
 
 Current status
 
