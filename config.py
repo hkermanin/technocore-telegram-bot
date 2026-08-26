@@ -3,6 +3,9 @@ import re
 
 from dotenv import load_dotenv
 
+
+load_dotenv()
+
 TECHNOCORE_API = "https://technocore.chat"
 ROOMS_LIMIT = 5
 MESSAGES_LIMIT = 10
@@ -12,7 +15,10 @@ WATCH_POLL_INTERVAL = 30
 MAX_WATCHES_PER_USER = 5
 REQUEST_TIMEOUT = 10
 TELEGRAM_TEXT_LIMIT = 3900
-DATABASE_PATH = "technocore.db"
+
+# Local default: ./technocore.db
+# Production example (Railway volume): /data/technocore.db
+DATABASE_PATH = os.getenv("DATABASE_PATH", "technocore.db")
 
 ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 MULTICODEC_ED25519 = b"\xed\x01"
@@ -40,5 +46,4 @@ BACKUP_FORMAT = "technocore-gateway-backup"
 BACKUP_VERSION = 2
 MAX_BACKUP_SIZE = 250_000
 
-load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
