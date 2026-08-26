@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -34,6 +35,9 @@ TECHNOCORE_API = "https://technocore.chat"
 ROOMS_LIMIT = 5
 MESSAGES_LIMIT = 10
 MAILBOX_MESSAGES_LIMIT = 20
+WATCH_FETCH_LIMIT = 200
+WATCH_POLL_INTERVAL = 30
+MAX_WATCHES_PER_USER = 5
 REQUEST_TIMEOUT = 10
 TELEGRAM_TEXT_LIMIT = 3900
 DATABASE_PATH = "technocore.db"
@@ -42,6 +46,12 @@ ROOM_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 MULTICODEC_ED25519 = b"\xed\x01"
 INVISIBLE_CATEGORIES = ("Cc", "Cf", "Cs", "Co", "Zl", "Zp")
 MAX_MESSAGE_CHARS = 4096
+MAX_NOTE_CHARS = 8192
+
+
+class DirectoryProfileConflictError(Exception):
+    """Raised when a DID directory note contains a different identity."""
+
 
 SCRYPT_N = 2**15
 SCRYPT_R = 8
@@ -69,7 +79,8 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     MAILBOX_TARGET,
     MAILBOX_TEXT,
     MAILBOX_PASSWORD,
-) = range(9)
+    MAILBOX_ACTIVATE_PASSWORD,
+) = range(10)
 
 
 # =========================================================
@@ -112,10 +123,39 @@ def init_database():
                 telegram_user_id INTEGER PRIMARY KEY,
                 room TEXT NOT NULL UNIQUE,
                 created_at TEXT NOT NULL,
-                last_read_seq INTEGER NOT NULL DEFAULT 0
+                last_read_seq INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 0
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS room_watches (
+                telegram_user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                room TEXT NOT NULL,
+                last_seq INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_user_id, room)
+            )
+            """
+        )
+
+        mailbox_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(mailboxes)"
+            ).fetchall()
+        }
+
+        if "is_active" not in mailbox_columns:
+            connection.execute(
+                """
+                ALTER TABLE mailboxes
+                ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
         connection.commit()
 
 
@@ -206,7 +246,12 @@ def get_mailbox(telegram_user_id):
     with get_db_connection() as connection:
         return connection.execute(
             """
-            SELECT telegram_user_id, room, created_at, last_read_seq
+            SELECT
+                telegram_user_id,
+                room,
+                created_at,
+                last_read_seq,
+                is_active
             FROM mailboxes
             WHERE telegram_user_id = ?
             """,
@@ -214,18 +259,40 @@ def get_mailbox(telegram_user_id):
         ).fetchone()
 
 
-def save_mailbox(telegram_user_id, room):
+def save_mailbox(telegram_user_id, room, is_active=False):
     created_at = datetime.now(timezone.utc).isoformat()
 
     with get_db_connection() as connection:
         connection.execute(
             """
             INSERT INTO mailboxes (
-                telegram_user_id, room, created_at, last_read_seq
+                telegram_user_id,
+                room,
+                created_at,
+                last_read_seq,
+                is_active
             )
-            VALUES (?, ?, ?, 0)
+            VALUES (?, ?, ?, 0, ?)
             """,
-            (telegram_user_id, room, created_at),
+            (
+                telegram_user_id,
+                room,
+                created_at,
+                1 if is_active else 0,
+            ),
+        )
+        connection.commit()
+
+
+def mark_mailbox_active(telegram_user_id):
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            UPDATE mailboxes
+            SET is_active = 1
+            WHERE telegram_user_id = ?
+            """,
+            (telegram_user_id,),
         )
         connection.commit()
 
@@ -239,6 +306,86 @@ def update_mailbox_last_read(telegram_user_id, last_seq):
             WHERE telegram_user_id = ?
             """,
             (last_seq, telegram_user_id),
+        )
+        connection.commit()
+
+
+def get_room_watch(telegram_user_id, room):
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT telegram_user_id, chat_id, room, last_seq, created_at
+            FROM room_watches
+            WHERE telegram_user_id = ? AND room = ?
+            """,
+            (telegram_user_id, room),
+        ).fetchone()
+
+
+def get_user_watches(telegram_user_id):
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT telegram_user_id, chat_id, room, last_seq, created_at
+            FROM room_watches
+            WHERE telegram_user_id = ?
+            ORDER BY created_at ASC
+            """,
+            (telegram_user_id,),
+        ).fetchall()
+
+
+def get_all_watches():
+    with get_db_connection() as connection:
+        return connection.execute(
+            """
+            SELECT telegram_user_id, chat_id, room, last_seq, created_at
+            FROM room_watches
+            ORDER BY room ASC, created_at ASC
+            """
+        ).fetchall()
+
+
+def save_room_watch(telegram_user_id, chat_id, room, last_seq):
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO room_watches (
+                telegram_user_id, chat_id, room, last_seq, created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_user_id, room) DO UPDATE SET
+                chat_id = excluded.chat_id,
+                last_seq = excluded.last_seq
+            """,
+            (telegram_user_id, chat_id, room, last_seq, created_at),
+        )
+        connection.commit()
+
+
+def update_room_watch_seq(telegram_user_id, room, last_seq):
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            UPDATE room_watches
+            SET last_seq = ?
+            WHERE telegram_user_id = ? AND room = ?
+            """,
+            (last_seq, telegram_user_id, room),
+        )
+        connection.commit()
+
+
+def delete_room_watch(telegram_user_id, room):
+    with get_db_connection() as connection:
+        connection.execute(
+            """
+            DELETE FROM room_watches
+            WHERE telegram_user_id = ? AND room = ?
+            """,
+            (telegram_user_id, room),
         )
         connection.commit()
 
@@ -392,6 +539,7 @@ def create_backup_data(identity, mailbox=None):
         "created_at": identity["created_at"],
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "mailbox": mailbox["room"] if mailbox else None,
+        "mailbox_active": bool(mailbox["is_active"]) if mailbox else False,
         "encryption": {
             "cipher": "AES-256-GCM",
             "kdf": {
@@ -473,6 +621,10 @@ def validate_backup_data(data):
         ):
             raise ValueError("Invalid mailbox in backup")
 
+    mailbox_active = data.get("mailbox_active", False)
+    if not isinstance(mailbox_active, bool):
+        mailbox_active = False
+
     return {
         "did": did,
         "encrypted_seed": encrypted_seed,
@@ -480,6 +632,7 @@ def validate_backup_data(data):
         "encryption_nonce": encryption_nonce,
         "created_at": created_at,
         "mailbox": mailbox,
+        "mailbox_active": mailbox_active,
     }
 
 
@@ -511,6 +664,210 @@ def get_room_messages(room_name, limit=MESSAGES_LIMIT):
     return response.json()
 
 
+def get_room_updates(room_name, since, limit=WATCH_FETCH_LIMIT):
+    if not ROOM_NAME_RE.fullmatch(room_name):
+        raise ValueError("Invalid room name")
+
+    safe_room_name = quote(room_name, safe="")
+    response = requests.get(
+        f"{TECHNOCORE_API}/r/{safe_room_name}",
+        params={
+            "format": "json",
+            "since": int(since),
+            "limit": limit,
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+# =========================================================
+# Technocore DID directory notes
+# =========================================================
+
+def did_directory_location(did):
+    fingerprint = hashlib.sha256(did.encode("utf-8")).hexdigest()[:16]
+    shard = fingerprint[:2]
+    key = fingerprint[2:]
+    namespace = f"did-{shard}"
+    path = f"/kv/{namespace}/{key}"
+    legacy_path = f"/kv/did/{fingerprint}"
+
+    return {
+        "fingerprint": fingerprint,
+        "shard": shard,
+        "key": key,
+        "namespace": namespace,
+        "path": path,
+        "legacy_path": legacy_path,
+    }
+
+
+def build_did_directory_value(identity, mailbox=None):
+    parts = [identity["did"]]
+
+    # Only advertise a mailbox that actually exists on Technocore.
+    if mailbox and mailbox["is_active"]:
+        parts.append(f"mailbox:{mailbox['room']}")
+
+    value = " ".join(parts)
+
+    if len(value) > MAX_NOTE_CHARS:
+        raise ValueError("DID directory profile is too large")
+
+    return value
+
+
+def strip_budget_footer(text):
+    # Technocore can append a low-budget status line to text replies.
+    lines = text.rstrip("\n").splitlines()
+    if lines and lines[-1].startswith("# budget: "):
+        lines.pop()
+    return "\n".join(lines).rstrip("\n")
+
+
+def strip_note_read_banner(text):
+    """Remove Technocore's server-added untrusted-content banner from note reads.
+
+    GET /kv/<ns>/<key> intentionally prefixes caller-controlled note data with
+    an untrusted-content warning. That warning is transport metadata, not part
+    of the stored note value, so it must not participate in DID comparisons or
+    compare-and-set (CAS) writes.
+    """
+
+    cleaned = strip_budget_footer(text)
+
+    if cleaned.startswith("!! UNTRUSTED CONTENT"):
+        _banner, separator, note_value = cleaned.partition("\n\n")
+        if separator:
+            return note_value.rstrip("\n")
+
+    return cleaned
+
+
+def get_note(namespace, key):
+    if not ROOM_NAME_RE.fullmatch(namespace) or not ROOM_NAME_RE.fullmatch(key):
+        raise ValueError("Invalid Technocore note path")
+
+    safe_namespace = quote(namespace, safe="")
+    safe_key = quote(key, safe="")
+    response = requests.get(
+        f"{TECHNOCORE_API}/kv/{safe_namespace}/{safe_key}",
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 404:
+        return None
+
+    response.raise_for_status()
+    return strip_note_read_banner(response.text)
+
+
+def get_did_directory_profile(did):
+    location = did_directory_location(did)
+
+    value = get_note(location["namespace"], location["key"])
+    if value is not None:
+        return {
+            "value": value,
+            "path": location["path"],
+            "legacy": False,
+            "location": location,
+        }
+
+    legacy_value = get_note("did", location["fingerprint"])
+    if legacy_value is not None:
+        return {
+            "value": legacy_value,
+            "path": location["legacy_path"],
+            "legacy": True,
+            "location": location,
+        }
+
+    return {
+        "value": None,
+        "path": location["path"],
+        "legacy": False,
+        "location": location,
+    }
+
+
+def set_did_directory_note(namespace, key, value, current_value=None):
+    safe_namespace = quote(namespace, safe="")
+    safe_key = quote(key, safe="")
+
+    payload = {"value": value}
+    if current_value is None:
+        payload["if_absent"] = True
+    else:
+        payload["if"] = current_value
+
+    response = requests.post(
+        f"{TECHNOCORE_API}/kv/{safe_namespace}/{safe_key}",
+        json=payload,
+        headers={"Accept": "text/plain"},
+        timeout=REQUEST_TIMEOUT,
+    )
+
+    if response.status_code == 409:
+        actual = strip_budget_footer(response.text)
+        raise DirectoryProfileConflictError(actual)
+
+    response.raise_for_status()
+
+
+def publish_did_directory_profile(identity, mailbox=None):
+    location = did_directory_location(identity["did"])
+    target_value = build_did_directory_value(identity, mailbox)
+    current_value = get_note(location["namespace"], location["key"])
+
+    if current_value == target_value:
+        return {
+            "status": "unchanged",
+            "value": target_value,
+            "path": location["path"],
+        }
+
+    if current_value is not None and not current_value.startswith(identity["did"]):
+        raise DirectoryProfileConflictError(current_value)
+
+    try:
+        set_did_directory_note(
+            location["namespace"],
+            location["key"],
+            target_value,
+            current_value=current_value,
+        )
+    except DirectoryProfileConflictError as error:
+        # A race may have changed the note after our read. Never overwrite a
+        # different DID automatically.
+        actual = str(error)
+        if actual != target_value and not actual.startswith(identity["did"]):
+            raise
+
+        if actual == target_value:
+            return {
+                "status": "unchanged",
+                "value": target_value,
+                "path": location["path"],
+            }
+
+        # Same DID, but another update won the race. Retry once with CAS.
+        set_did_directory_note(
+            location["namespace"],
+            location["key"],
+            target_value,
+            current_value=actual,
+        )
+
+    return {
+        "status": "published" if current_value is None else "updated",
+        "value": target_value,
+        "path": location["path"],
+    }
+
+
 # =========================================================
 # Keyboards
 # =========================================================
@@ -519,11 +876,13 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("🔥 Browse Rooms", callback_data="show_rooms")],
+            [InlineKeyboardButton("🔔 Watched Rooms", callback_data="watched_rooms")],
             [InlineKeyboardButton("📬 Mailbox", callback_data="mailbox_menu")],
             [
                 InlineKeyboardButton("🪪 Create DID", callback_data="create_did"),
                 InlineKeyboardButton("👤 My Identity", callback_data="my_identity"),
             ],
+            [InlineKeyboardButton("🌐 DID Profile", callback_data="did_profile")],
             [InlineKeyboardButton("♻️ Import Backup", callback_data="import_backup")],
             [InlineKeyboardButton("ℹ️ About", callback_data="about")],
         ]
@@ -534,6 +893,7 @@ def identity_keyboard():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("📦 Export Backup", callback_data="export_backup")],
+            [InlineKeyboardButton("🌐 DID Profile", callback_data="did_profile")],
             [InlineKeyboardButton("📬 Mailbox", callback_data="mailbox_menu")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
         ]
@@ -550,11 +910,45 @@ def no_identity_keyboard():
     )
 
 
-def mailbox_keyboard(has_mailbox):
-    if not has_mailbox:
+def did_profile_keyboard(has_remote_profile=False):
+    publish_label = (
+        "🔄 Update Directory Profile"
+        if has_remote_profile
+        else "📡 Publish Directory Profile"
+    )
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(publish_label, callback_data="publish_did_profile")],
+            [InlineKeyboardButton("🔄 Refresh Profile", callback_data="did_profile")],
+            [InlineKeyboardButton("👤 My Identity", callback_data="my_identity")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+        ]
+    )
+
+
+def mailbox_keyboard(mailbox):
+    if not mailbox:
         return InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("📬 Create Mailbox", callback_data="create_mailbox")],
+                [InlineKeyboardButton("📬 Generate Mailbox Address", callback_data="create_mailbox")],
+                [InlineKeyboardButton("✉️ Send to Mailbox", callback_data="send_mailbox")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+            ]
+        )
+
+    is_active = (
+        bool(mailbox["is_active"])
+        if not isinstance(mailbox, bool)
+        else mailbox
+    )
+
+    if not is_active:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("⚡ Activate Mailbox", callback_data="activate_mailbox")],
+                [InlineKeyboardButton("✉️ Send to Mailbox", callback_data="send_mailbox")],
+                [InlineKeyboardButton("🔄 Check Status", callback_data="mailbox_menu")],
                 [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
             ]
         )
@@ -594,8 +988,33 @@ def room_keyboard():
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✍️ Send Signed Message", callback_data="send_signed")],
+            [InlineKeyboardButton("🔔 Watch This Room", callback_data="watch_current_room")],
+            [InlineKeyboardButton("🔔 Watched Rooms", callback_data="watched_rooms")],
             [InlineKeyboardButton("⬅️ Back to Rooms", callback_data="show_rooms")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
+        ]
+    )
+
+
+def watched_rooms_keyboard(watches):
+    keyboard = []
+
+    for watch in watches:
+        room = watch["room"]
+        keyboard.append(
+            [InlineKeyboardButton(f"🔕 Stop: {room}", callback_data=f"stopwatch:{room}")]
+        )
+
+    keyboard.append([InlineKeyboardButton("🔥 Browse Rooms", callback_data="show_rooms")])
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="home")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def watch_notification_keyboard(room):
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📖 Open Room", callback_data=f"openwatch:{room}")],
+            [InlineKeyboardButton("🔕 Stop Watching", callback_data=f"stopwatch:{room}")],
         ]
     )
 
@@ -680,6 +1099,77 @@ def identity_text(identity):
     )
 
 
+def did_profile_text(identity, mailbox, remote_profile):
+    location = did_directory_location(identity["did"])
+    expected_value = build_did_directory_value(identity, mailbox)
+    remote_value = remote_profile.get("value") if remote_profile else None
+
+    lines = [
+        "🌐 Technocore DID Profile",
+        "",
+        "DID:",
+        identity["did"],
+        "",
+        f"Fingerprint: {location['fingerprint']}",
+        "Directory path:",
+        location["path"],
+        "",
+    ]
+
+    if mailbox and mailbox["is_active"]:
+        lines.extend([
+            "📬 Active mailbox advertised:",
+            mailbox["room"],
+            "",
+        ])
+    elif mailbox:
+        lines.extend([
+            "📬 Mailbox: pending / inactive",
+            "It will NOT be advertised until Technocore activation succeeds.",
+            "",
+        ])
+    else:
+        lines.extend([
+            "📬 Mailbox: none",
+            "The profile can still publish the DID alone.",
+            "",
+        ])
+
+    if remote_value is None:
+        lines.extend([
+            "⏳ Directory status: NOT PUBLISHED",
+            "",
+            "Value that will be published:",
+            expected_value,
+        ])
+    else:
+        if remote_value == expected_value:
+            status = "✅ Directory status: PUBLISHED AND CURRENT"
+        elif remote_value.startswith(identity["did"]):
+            status = "⚠️ Directory status: PUBLISHED BUT OUTDATED"
+        else:
+            status = "🚨 Directory status: CONFLICT / OVERWRITTEN"
+
+        lines.extend([
+            status,
+            f"Remote path: {remote_profile['path']}",
+            "",
+            "Remote value:",
+            remote_value[:1200],
+        ])
+
+        if len(remote_value) > 1200:
+            lines.append("… remote value truncated for Telegram")
+
+    lines.extend([
+        "",
+        "⚠️ Trust note:",
+        "DID directory notes are world-readable and world-writable. The note itself is NOT proof of ownership; signed did:key messages are the cryptographic proof.",
+    ])
+
+    return "\n".join(lines)
+
+
 def generate_mailbox_name():
     return "mb-p-" + secrets.token_hex(16)
 
@@ -688,19 +1178,107 @@ def mailbox_text(mailbox):
     if not mailbox:
         return (
             "📬 Technocore Mailbox\n\n"
-            "You do not have a mailbox yet.\n\n"
-            "A mailbox created here will use an unlisted random mb-p- address and will "
-            "accept signed writes only."
+            "You do not have a mailbox address yet.\n\n"
+            "The bot can generate a random mb-p- address locally, but the mailbox only "
+            "exists on Technocore after a signed activation write succeeds."
+        )
+
+    if not mailbox["is_active"]:
+        return (
+            "📬 Technocore Mailbox\n\n"
+            f"Candidate address:\n{mailbox['room']}\n\n"
+            "⏳ Status: NOT ACTIVE on Technocore yet.\n\n"
+            "Press Activate Mailbox to create it with a signed write. If the hosted "
+            "Technocore instance is at its room-capacity limit, activation will remain "
+            "pending and you can retry later.\n\n"
+            "⚠️ The address is not reserved by the server until activation succeeds."
         )
 
     return (
         "📬 Your Technocore Mailbox\n\n"
         f"Address:\n{mailbox['room']}\n\n"
-        f"Created:\n{mailbox['created_at']}\n\n"
+        f"Created locally:\n{mailbox['created_at']}\n\n"
+        "✅ Active on Technocore\n"
         "✅ Unlisted from public room discovery\n"
         "✅ Signed writes only\n"
         "⚠️ Not end-to-end encrypted: anyone who learns the mailbox name can read it."
     )
+
+
+def mailbox_is_active_for_identity(mailbox, identity):
+    if not mailbox or not identity:
+        return False
+
+    if mailbox["is_active"]:
+        return True
+
+    try:
+        mailbox_data = get_room_messages(
+            mailbox["room"],
+            limit=20,
+        )
+    except (requests.RequestException, ValueError):
+        return False
+
+    for message in mailbox_data.get("messages", []):
+        if message.get("from") == identity["did"]:
+            mark_mailbox_active(identity["telegram_user_id"])
+            return True
+
+    return False
+
+
+def watched_rooms_text(watches):
+    if not watches:
+        return (
+            "🔔 Watched Rooms\n\n"
+            "You are not watching any Technocore rooms yet.\n\n"
+            "Open Browse Rooms, select a room and press 🔔 Watch This Room."
+        )
+
+    lines = ["🔔 Watched Rooms", ""]
+    for watch in watches:
+        lines.append(f"• {watch['room']}")
+
+    lines.append("")
+    lines.append(
+        f"Notifications are checked about every {WATCH_POLL_INTERVAL} seconds "
+        "while the bot process is running."
+    )
+    return "\n".join(lines)
+
+
+def format_watch_notification(room, messages, missed=False):
+    title = f"🔔 New Technocore activity\n\nRoom: {room}\n"
+    if missed:
+        title += "\n⚠️ The room moved too quickly and some messages may have been skipped.\n"
+
+    text = title + "\n"
+    shown = 0
+
+    for message in messages:
+        sender = shorten_sender(message.get("from", "unknown"))
+        content = message.get("text", "")
+        seq = message.get("seq", "?")
+
+        if len(content) > 450:
+            content = content[:450] + "..."
+
+        block = f"#{seq} — {sender}\n{content}\n\n"
+        if len(text) + len(block) > TELEGRAM_TEXT_LIMIT:
+            break
+
+        text += block
+        shown += 1
+
+        if shown >= 8:
+            break
+
+    omitted = max(0, len(messages) - shown)
+    if omitted:
+        text += f"… {omitted} more new message(s) not shown here.\n"
+
+    return text.rstrip()
 
 
 def clear_import_state(context):
@@ -727,7 +1305,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "⚡ Technocore Gateway\n\n"
         "Access Technocore directly from Telegram.\n\n"
-        "Browse rooms, manage your DID, send signed messages and use a Technocore mailbox.",
+        "Browse rooms, manage your DID, send signed messages, watch rooms and use a Technocore mailbox.",
         reply_markup=main_menu_keyboard(),
     )
 
@@ -759,6 +1337,69 @@ async def read_room(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Could not read room: {room_name}")
 
 
+async def watch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /watch <room>\n\nExample:\n/watch lobby"
+        )
+        return
+
+    room = context.args[0].strip()
+    user_id = update.effective_user.id
+
+    if not ROOM_NAME_RE.fullmatch(room):
+        await update.message.reply_text("❌ Invalid Technocore room name.")
+        return
+
+    if get_room_watch(user_id, room):
+        await update.message.reply_text(
+            f"🔔 You are already watching {room}.",
+            reply_markup=watched_rooms_keyboard(get_user_watches(user_id)),
+        )
+        return
+
+    if len(get_user_watches(user_id)) >= MAX_WATCHES_PER_USER:
+        await update.message.reply_text(
+            f"❌ You can watch up to {MAX_WATCHES_PER_USER} rooms in this MVP."
+        )
+        return
+
+    try:
+        room_data = get_room_messages(room, limit=1)
+        last_seq = room_data.get("last_seq", 0) or 0
+        save_room_watch(
+            user_id,
+            update.effective_chat.id,
+            room,
+            last_seq,
+        )
+        await update.message.reply_text(
+            f"✅ Watching {room}. New activity will be sent here.",
+            reply_markup=watched_rooms_keyboard(get_user_watches(user_id)),
+        )
+    except (requests.RequestException, ValueError):
+        await update.message.reply_text("❌ Could not watch that room.")
+
+
+async def unwatch_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /unwatch <room>\n\nExample:\n/unwatch lobby"
+        )
+        return
+
+    room = context.args[0].strip()
+    if ROOM_NAME_RE.fullmatch(room):
+        delete_room_watch(update.effective_user.id, room)
+
+    await update.message.reply_text(
+        f"🔕 Stopped watching {room}.",
+        reply_markup=watched_rooms_keyboard(
+            get_user_watches(update.effective_user.id)
+        ),
+    )
+
+
 async def identity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     identity = get_identity(update.effective_user.id)
 
@@ -773,6 +1414,31 @@ async def identity_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         identity_text(identity),
         reply_markup=identity_keyboard(),
     )
+
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    identity = get_identity(update.effective_user.id)
+
+    if not identity:
+        await update.message.reply_text(
+            "🪪 You need a DID before publishing a directory profile.",
+            reply_markup=no_identity_keyboard(),
+        )
+        return
+
+    mailbox = get_mailbox(update.effective_user.id)
+
+    try:
+        remote_profile = get_did_directory_profile(identity["did"])
+        await update.message.reply_text(
+            did_profile_text(identity, mailbox, remote_profile),
+            reply_markup=did_profile_keyboard(remote_profile["value"] is not None),
+        )
+    except requests.RequestException:
+        await update.message.reply_text(
+            "❌ Could not read the Technocore DID directory right now.",
+            reply_markup=identity_keyboard(),
+        )
 
 
 # =========================================================
@@ -978,7 +1644,11 @@ async def receive_import_password(update: Update, context: ContextTypes.DEFAULT_
         )
 
         if backup.get("mailbox") and not get_mailbox(update.effective_user.id):
-            save_mailbox(update.effective_user.id, backup["mailbox"])
+            save_mailbox(
+                update.effective_user.id,
+                backup["mailbox"],
+                is_active=backup.get("mailbox_active", False),
+            )
 
         restored_did = backup["did"]
         clear_import_state(context)
@@ -1181,6 +1851,210 @@ async def cancel_signed_message(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 # =========================================================
+# Mailbox activation conversation
+# =========================================================
+
+async def start_mailbox_activation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    query = update.callback_query
+    await query.answer()
+
+    identity = get_identity(update.effective_user.id)
+    mailbox = get_mailbox(update.effective_user.id)
+
+    if not identity:
+        await query.edit_message_text(
+            "🪪 You need a DID before activating a mailbox.",
+            reply_markup=no_identity_keyboard(),
+        )
+        return ConversationHandler.END
+
+    if not mailbox:
+        await query.edit_message_text(
+            "📬 Generate a mailbox address first.",
+            reply_markup=mailbox_keyboard(None),
+        )
+        return ConversationHandler.END
+
+    if mailbox["is_active"]:
+        await query.edit_message_text(
+            mailbox_text(mailbox),
+            reply_markup=mailbox_keyboard(mailbox),
+        )
+        return ConversationHandler.END
+
+    context.user_data["mailbox_activation_attempts"] = 0
+
+    await query.edit_message_text(
+        "⚡ Activate Technocore Mailbox\n\n"
+        f"Candidate address:\n{mailbox['room']}\n\n"
+        "Activation sends signed initialization messages to Technocore. "
+        "The mailbox is only considered created if the server accepts them.\n\n"
+        "🔐 Send your DID password now.\n\n"
+        "The password will not be stored. Use /cancel to stop."
+    )
+
+    return MAILBOX_ACTIVATE_PASSWORD
+
+
+async def receive_mailbox_activation_password(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    password = update.message.text
+    await delete_sensitive_message(update)
+
+    identity = get_identity(update.effective_user.id)
+    mailbox = get_mailbox(update.effective_user.id)
+
+    if not identity or not mailbox:
+        await update.effective_chat.send_message(
+            "❌ Mailbox activation session expired.",
+            reply_markup=main_menu_keyboard(),
+        )
+        return ConversationHandler.END
+
+    if mailbox["is_active"]:
+        await update.effective_chat.send_message(
+            mailbox_text(mailbox),
+            reply_markup=mailbox_keyboard(mailbox),
+        )
+        return ConversationHandler.END
+
+    attempts = context.user_data.get("mailbox_activation_attempts", 0)
+
+    try:
+        seed = decrypt_seed(
+            identity["encrypted_seed"],
+            identity["salt"],
+            identity["encryption_nonce"],
+            password,
+        )
+    except InvalidTag:
+        attempts += 1
+        context.user_data["mailbox_activation_attempts"] = attempts
+
+        if attempts >= MAX_PASSWORD_ATTEMPTS:
+            context.user_data.pop("mailbox_activation_attempts", None)
+            await update.effective_chat.send_message(
+                "❌ Mailbox activation cancelled after 3 incorrect password attempts.",
+                reply_markup=mailbox_keyboard(mailbox),
+            )
+            return ConversationHandler.END
+
+        await update.effective_chat.send_message(
+            "❌ Incorrect password.\n\n"
+            f"Attempts remaining: {MAX_PASSWORD_ATTEMPTS - attempts}"
+        )
+        return MAILBOX_ACTIVATE_PASSWORD
+
+    try:
+        if not hmac.compare_digest(did_from_seed(seed), identity["did"]):
+            raise ValueError("Stored identity mismatch")
+
+        # First accepted write creates the mailbox room.
+        first_nonce = get_next_nonce(
+            update.effective_user.id,
+            mailbox["room"],
+        )
+        send_signed_message(
+            mailbox["room"],
+            "Technocore Gateway mailbox initialized.",
+            identity["did"],
+            seed,
+            first_nonce,
+        )
+
+        # A second write moves the room beyond the special first-message
+        # retention case used by Technocore.
+        second_nonce = get_next_nonce(
+            update.effective_user.id,
+            mailbox["room"],
+        )
+        send_signed_message(
+            mailbox["room"],
+            "Technocore Gateway mailbox ready.",
+            identity["did"],
+            seed,
+            second_nonce,
+        )
+
+        mark_mailbox_active(update.effective_user.id)
+        context.user_data.pop("mailbox_activation_attempts", None)
+        mailbox = get_mailbox(update.effective_user.id)
+
+        await update.effective_chat.send_message(
+            "✅ Mailbox activated on Technocore!\n\n"
+            f"Address:\n{mailbox['room']}\n\n"
+            "Two signed initialization messages were accepted, so the mailbox now "
+            "exists on the server.",
+            reply_markup=mailbox_keyboard(mailbox),
+        )
+        return ConversationHandler.END
+
+    except requests.HTTPError as error:
+        context.user_data.pop("mailbox_activation_attempts", None)
+        response_text = (
+            error.response.text[:700]
+            if error.response is not None
+            else ""
+        )
+
+        if "room limit reached" in response_text.lower():
+            await update.effective_chat.send_message(
+                "⏳ Mailbox activation is temporarily blocked by Technocore capacity.\n\n"
+                "The hosted server is refusing creation of new rooms right now. "
+                "Your candidate mailbox address is still stored locally, but it does "
+                "NOT exist on Technocore yet.\n\n"
+                "Nothing is lost — use ⚡ Activate Mailbox later to retry.\n\n"
+                f"Server response:\n{response_text}",
+                reply_markup=mailbox_keyboard(mailbox),
+            )
+        else:
+            await update.effective_chat.send_message(
+                "❌ Technocore rejected mailbox activation.\n\n"
+                f"{response_text}",
+                reply_markup=mailbox_keyboard(mailbox),
+            )
+
+        return ConversationHandler.END
+
+    except requests.RequestException:
+        context.user_data.pop("mailbox_activation_attempts", None)
+        await update.effective_chat.send_message(
+            "⚠️ Network error during mailbox activation. "
+            "The mailbox was not marked active; retry later.",
+            reply_markup=mailbox_keyboard(mailbox),
+        )
+        return ConversationHandler.END
+
+    except Exception as error:
+        print("Mailbox activation error:", repr(error))
+        context.user_data.pop("mailbox_activation_attempts", None)
+        await update.effective_chat.send_message(
+            "❌ Could not activate the mailbox.",
+            reply_markup=mailbox_keyboard(mailbox),
+        )
+        return ConversationHandler.END
+
+
+async def cancel_mailbox_activation(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    context.user_data.pop("mailbox_activation_attempts", None)
+    mailbox = get_mailbox(update.effective_user.id)
+
+    await update.message.reply_text(
+        "Mailbox activation cancelled.",
+        reply_markup=mailbox_keyboard(mailbox),
+    )
+    return ConversationHandler.END
+
+
+# =========================================================
 # Mailbox send conversation
 # =========================================================
 
@@ -1200,7 +2074,7 @@ async def start_mailbox_send(update: Update, context: ContextTypes.DEFAULT_TYPE)
     clear_mailbox_send_state(context)
 
     own_hint = ""
-    if own_mailbox:
+    if own_mailbox and own_mailbox["is_active"]:
         own_hint = (
             "\n\nFor testing, you can send to your own mailbox:\n"
             f"{own_mailbox['room']}"
@@ -1222,6 +2096,18 @@ async def receive_mailbox_target(update: Update, context: ContextTypes.DEFAULT_T
         await update.message.reply_text(
             "❌ Invalid mailbox address.\n\n"
             "Example format:\nmb-p-0123456789abcdef..."
+        )
+        return MAILBOX_TARGET
+
+    own_mailbox = get_mailbox(update.effective_user.id)
+    if (
+        own_mailbox
+        and target == own_mailbox["room"]
+        and not own_mailbox["is_active"]
+    ):
+        await update.message.reply_text(
+            "⏳ Your mailbox address has not been activated on Technocore yet.\n\n"
+            "Open 📬 Mailbox and use ⚡ Activate Mailbox first."
         )
         return MAILBOX_TARGET
 
@@ -1347,6 +2233,94 @@ async def cancel_mailbox_send(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # =========================================================
+# Room watch notifications
+# =========================================================
+
+async def watch_rooms_job(context: ContextTypes.DEFAULT_TYPE):
+    watches = get_all_watches()
+    if not watches:
+        return
+
+    watches_by_room = {}
+    for watch in watches:
+        watches_by_room.setdefault(watch["room"], []).append(watch)
+
+    for room, room_watches in watches_by_room.items():
+        since = min(watch["last_seq"] for watch in room_watches)
+
+        try:
+            room_data = await asyncio.to_thread(
+                get_room_updates,
+                room,
+                since,
+            )
+        except requests.HTTPError as error:
+            status = error.response.status_code if error.response is not None else None
+
+            if status == 404:
+                for watch in room_watches:
+                    delete_room_watch(watch["telegram_user_id"], room)
+                    try:
+                        await context.bot.send_message(
+                            chat_id=watch["chat_id"],
+                            text=(
+                                "🔕 Room watch stopped\n\n"
+                                f"{room} no longer exists on Technocore."
+                            ),
+                            reply_markup=main_menu_keyboard(),
+                        )
+                    except Exception:
+                        pass
+            continue
+        except (requests.RequestException, ValueError):
+            continue
+
+        messages = room_data.get("messages", [])
+        latest_seq = room_data.get("last_seq", since) or since
+        first_seq = room_data.get("first_seq")
+
+        for watch in room_watches:
+            watcher_last_seq = watch["last_seq"]
+            new_messages = [
+                message
+                for message in messages
+                if isinstance(message.get("seq"), int)
+                and message["seq"] > watcher_last_seq
+            ]
+
+            missed = (
+                isinstance(first_seq, int)
+                and first_seq > watcher_last_seq + 1
+            )
+
+            if new_messages:
+                try:
+                    await context.bot.send_message(
+                        chat_id=watch["chat_id"],
+                        text=format_watch_notification(
+                            room,
+                            new_messages,
+                            missed=missed,
+                        ),
+                        reply_markup=watch_notification_keyboard(room),
+                    )
+                except Exception as error:
+                    print(
+                        "Watch notification error:",
+                        room,
+                        watch["telegram_user_id"],
+                        repr(error),
+                    )
+
+            if latest_seq > watcher_last_seq:
+                update_room_watch_seq(
+                    watch["telegram_user_id"],
+                    room,
+                    latest_seq,
+                )
+
+
+# =========================================================
 # General buttons
 # =========================================================
 
@@ -1373,12 +2347,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Encrypted key storage\n"
             "• Export / restore backup\n"
             "• Send signed room messages\n"
-            "• Create an unlisted signed-only mailbox\n"
-            "• Read and send mailbox messages\n\n"
+            "• Generate and activate an unlisted signed-only mailbox\n"
+            "• Capacity-aware mailbox activation\n"
+            "• Read and send mailbox messages\n"
+            "• Watch existing rooms with Telegram notifications\n"
+            "• Publish the canonical sharded DID directory profile\n"
+            "• Advertise an active mailbox in the DID note\n\n"
             "Next:\n"
-            "• Publish DID + mailbox directory note\n"
-            "• Telegram mailbox notifications\n"
-            "• Optional E2E encrypted messaging",
+            "• X25519 key publishing + optional E2E messaging\n"
+            "• Mailbox notifications when capacity allows activation\n"
+            "• README cleanup and 24/7 deployment",
             reply_markup=main_menu_keyboard(),
         )
         return
@@ -1394,6 +2372,99 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 "🪪 No identity found.",
                 reply_markup=no_identity_keyboard(),
+            )
+        return
+
+    if data == "did_profile":
+        identity = get_identity(user_id)
+        if not identity:
+            await query.edit_message_text(
+                "🪪 You need a DID before publishing a directory profile.",
+                reply_markup=no_identity_keyboard(),
+            )
+            return
+
+        mailbox = get_mailbox(user_id)
+
+        try:
+            remote_profile = get_did_directory_profile(identity["did"])
+            await query.edit_message_text(
+                did_profile_text(identity, mailbox, remote_profile),
+                reply_markup=did_profile_keyboard(remote_profile["value"] is not None),
+            )
+        except requests.RequestException:
+            await query.edit_message_text(
+                "❌ Could not read the Technocore DID directory right now.",
+                reply_markup=identity_keyboard(),
+            )
+        return
+
+    if data == "publish_did_profile":
+        identity = get_identity(user_id)
+        if not identity:
+            await query.edit_message_text(
+                "🪪 You need a DID before publishing a directory profile.",
+                reply_markup=no_identity_keyboard(),
+            )
+            return
+
+        mailbox = get_mailbox(user_id)
+
+        try:
+            result = publish_did_directory_profile(identity, mailbox)
+            remote_profile = get_did_directory_profile(identity["did"])
+
+            if result["status"] == "unchanged":
+                prefix = "✅ Your directory profile is already current."
+            elif result["status"] == "updated":
+                prefix = "✅ DID directory profile updated!"
+            else:
+                prefix = "✅ DID directory profile published!"
+
+            mailbox_note = ""
+            if mailbox and not mailbox["is_active"]:
+                mailbox_note = (
+                    "\n\n⏳ Your local mailbox is still inactive, so it was intentionally "
+                    "NOT advertised. Publish again after mailbox activation succeeds."
+                )
+
+            await query.edit_message_text(
+                prefix
+                + "\n\n"
+                + did_profile_text(identity, mailbox, remote_profile)
+                + mailbox_note,
+                reply_markup=did_profile_keyboard(True),
+            )
+        except DirectoryProfileConflictError as error:
+            conflicting_value = str(error)[:1200]
+            await query.edit_message_text(
+                "🚨 DID directory conflict detected.\n\n"
+                "The sharded directory path currently contains a value that does not "
+                "start with your DID. The bot refused to overwrite it automatically.\n\n"
+                f"Current remote value:\n{conflicting_value}\n\n"
+                "Remember: ordinary DID notes are world-writable and are not identity proof.",
+                reply_markup=did_profile_keyboard(True),
+            )
+        except requests.HTTPError as error:
+            response_text = (
+                strip_budget_footer(error.response.text)[:1000]
+                if error.response is not None
+                else ""
+            )
+            await query.edit_message_text(
+                "❌ Technocore rejected the DID directory update.\n\n"
+                f"{response_text}",
+                reply_markup=did_profile_keyboard(False),
+            )
+        except requests.RequestException:
+            await query.edit_message_text(
+                "⚠️ Network error while publishing the DID directory profile.",
+                reply_markup=did_profile_keyboard(False),
+            )
+        except ValueError as error:
+            await query.edit_message_text(
+                f"❌ Could not build the DID profile: {error}",
+                reply_markup=identity_keyboard(),
             )
         return
 
@@ -1414,6 +2485,97 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "watched_rooms":
+        watches = get_user_watches(user_id)
+        await query.edit_message_text(
+            watched_rooms_text(watches),
+            reply_markup=watched_rooms_keyboard(watches),
+        )
+        return
+
+    if data == "watch_current_room":
+        room = context.user_data.get("current_room")
+        if not room:
+            await query.edit_message_text(
+                "❌ No room selected. Open Browse Rooms first.",
+                reply_markup=main_menu_keyboard(),
+            )
+            return
+
+        if get_room_watch(user_id, room):
+            watches = get_user_watches(user_id)
+            await query.edit_message_text(
+                f"🔔 You are already watching {room}.",
+                reply_markup=watched_rooms_keyboard(watches),
+            )
+            return
+
+        watches = get_user_watches(user_id)
+        if len(watches) >= MAX_WATCHES_PER_USER:
+            await query.edit_message_text(
+                f"❌ You can watch up to {MAX_WATCHES_PER_USER} rooms in this MVP.",
+                reply_markup=watched_rooms_keyboard(watches),
+            )
+            return
+
+        try:
+            room_data = get_room_messages(room, limit=1)
+            last_seq = room_data.get("last_seq", 0) or 0
+            save_room_watch(
+                user_id,
+                query.message.chat_id,
+                room,
+                last_seq,
+            )
+            await query.edit_message_text(
+                "✅ Room watch enabled!\n\n"
+                f"Room: {room}\n\n"
+                "You will receive Telegram notifications for new messages "
+                f"about every {WATCH_POLL_INTERVAL} seconds while the bot is running.",
+                reply_markup=watched_rooms_keyboard(get_user_watches(user_id)),
+            )
+        except (requests.RequestException, ValueError):
+            await query.edit_message_text(
+                "❌ Could not enable notifications for this room.",
+                reply_markup=room_keyboard(),
+            )
+        return
+
+    if data.startswith("stopwatch:"):
+        room = data.split(":", 1)[1]
+        if ROOM_NAME_RE.fullmatch(room):
+            delete_room_watch(user_id, room)
+
+        watches = get_user_watches(user_id)
+        await query.edit_message_text(
+            f"🔕 Stopped watching: {room}\n\n" + watched_rooms_text(watches),
+            reply_markup=watched_rooms_keyboard(watches),
+        )
+        return
+
+    if data.startswith("openwatch:"):
+        room = data.split(":", 1)[1]
+        if not ROOM_NAME_RE.fullmatch(room):
+            return
+
+        context.user_data["current_room"] = room
+        try:
+            room_data = get_room_messages(room)
+            text = format_messages(
+                f"💬 {room}",
+                room_data.get("messages", []),
+            )
+            await query.edit_message_text(
+                text,
+                reply_markup=room_keyboard(),
+            )
+        except (requests.RequestException, ValueError):
+            await query.edit_message_text(
+                "❌ Could not read this room.",
+                reply_markup=main_menu_keyboard(),
+            )
+        return
+
     if data == "mailbox_menu":
         identity = get_identity(user_id)
         if not identity:
@@ -1424,9 +2586,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         mailbox = get_mailbox(user_id)
+
+        if mailbox and not mailbox["is_active"]:
+            mailbox_is_active_for_identity(
+                mailbox,
+                identity,
+            )
+            mailbox = get_mailbox(user_id)
+
         await query.edit_message_text(
             mailbox_text(mailbox),
-            reply_markup=mailbox_keyboard(mailbox is not None),
+            reply_markup=mailbox_keyboard(mailbox),
         )
         return
 
@@ -1443,25 +2613,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if existing:
             await query.edit_message_text(
                 mailbox_text(existing),
-                reply_markup=mailbox_keyboard(True),
+                reply_markup=mailbox_keyboard(existing),
             )
             return
 
         try:
             room = generate_mailbox_name()
-            save_mailbox(user_id, room)
+            save_mailbox(
+                user_id,
+                room,
+                is_active=False,
+            )
             mailbox = get_mailbox(user_id)
+
             await query.edit_message_text(
-                "✅ Mailbox created!\n\n"
-                f"Address:\n{room}\n\n"
-                "The address is random, unlisted and accepts signed writes only.\n\n"
-                "⚠️ It is not E2E encrypted. Anyone who learns the address can read it.",
-                reply_markup=mailbox_keyboard(True),
+                "📬 Mailbox address generated locally.\n\n"
+                f"Candidate address:\n{room}\n\n"
+                "This is NOT yet a real Technocore mailbox. Press ⚡ Activate Mailbox "
+                "to create the room with a signed write. The bot will only mark it active "
+                "after Technocore accepts the activation.",
+                reply_markup=mailbox_keyboard(mailbox),
             )
         except sqlite3.IntegrityError:
             await query.edit_message_text(
-                "❌ Could not create a unique mailbox. Please try again.",
-                reply_markup=mailbox_keyboard(False),
+                "❌ Could not generate a unique mailbox address. Please try again.",
+                reply_markup=mailbox_keyboard(None),
             )
         return
 
@@ -1470,7 +2646,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not mailbox:
             await query.edit_message_text(
                 "📬 You do not have a mailbox yet.",
-                reply_markup=mailbox_keyboard(False),
+                reply_markup=mailbox_keyboard(None),
+            )
+            return
+
+        if not mailbox["is_active"]:
+            await query.edit_message_text(
+                "⏳ This mailbox address has not been activated on Technocore yet.",
+                reply_markup=mailbox_keyboard(mailbox),
             )
             return
 
@@ -1496,7 +2679,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (requests.RequestException, ValueError):
             await query.edit_message_text(
                 "❌ Could not read your mailbox.",
-                reply_markup=mailbox_keyboard(True),
+                reply_markup=mailbox_keyboard(mailbox),
             )
         return
 
@@ -1592,6 +2775,30 @@ def main():
         allow_reentry=True,
     )
 
+    mailbox_activation_conversation = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(
+                start_mailbox_activation,
+                pattern=r"^activate_mailbox$",
+            )
+        ],
+        states={
+            MAILBOX_ACTIVATE_PASSWORD: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND,
+                    receive_mailbox_activation_password,
+                )
+            ],
+        },
+        fallbacks=[
+            CommandHandler(
+                "cancel",
+                cancel_mailbox_activation,
+            )
+        ],
+        allow_reentry=True,
+    )
+
     mailbox_send_conversation = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(start_mailbox_send, pattern=r"^send_mailbox$")
@@ -1614,13 +2821,29 @@ def main():
     app.add_handler(did_conversation)
     app.add_handler(import_conversation)
     app.add_handler(signed_message_conversation)
+    app.add_handler(mailbox_activation_conversation)
     app.add_handler(mailbox_send_conversation)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("rooms", rooms))
     app.add_handler(CommandHandler("read", read_room))
+    app.add_handler(CommandHandler("watch", watch_command))
+    app.add_handler(CommandHandler("unwatch", unwatch_command))
     app.add_handler(CommandHandler("identity", identity_command))
+    app.add_handler(CommandHandler("profile", profile_command))
     app.add_handler(CallbackQueryHandler(button_handler))
+
+    if app.job_queue is None:
+        raise RuntimeError(
+            'JobQueue is unavailable. Install: python-telegram-bot[job-queue]'
+        )
+
+    app.job_queue.run_repeating(
+        watch_rooms_job,
+        interval=WATCH_POLL_INTERVAL,
+        first=5,
+        name="technocore-room-watch",
+    )
 
     print("Technocore Gateway is running...")
     app.run_polling()
