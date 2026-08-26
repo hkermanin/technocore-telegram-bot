@@ -6,6 +6,12 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from config import TELEGRAM_TEXT_LIMIT, WATCH_POLL_INTERVAL
 from crypto_utils import decrypt_e2e_room_text
 from database import get_e2e_chats, get_e2e_key, mark_mailbox_active
+PROJECT_REPO_URL = "https://github.com/hkermanin/technocore-telegram-bot"
+DEVELOPER_GITHUB_URL = "https://github.com/hkermanin"
+DEVELOPER_X_URL = "https://x.com/ananimatorman"
+TECHNOCORE_URL = "https://technocore.chat"
+
+
 from technocore_api import (
     build_did_directory_value,
     did_directory_location,
@@ -28,6 +34,22 @@ def main_menu_keyboard():
             [InlineKeyboardButton("🔐 E2E Messaging", callback_data="e2e_menu")],
             [InlineKeyboardButton("♻️ Import Backup", callback_data="import_backup")],
             [InlineKeyboardButton("ℹ️ About", callback_data="about")],
+        ]
+    )
+
+
+def about_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📦 Source Code", url=PROJECT_REPO_URL),
+                InlineKeyboardButton("👨‍💻 GitHub", url=DEVELOPER_GITHUB_URL),
+            ],
+            [
+                InlineKeyboardButton("𝕏 Developer X", url=DEVELOPER_X_URL),
+                InlineKeyboardButton("🌐 Technocore", url=TECHNOCORE_URL),
+            ],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="home")],
         ]
     )
 

@@ -83,6 +83,7 @@ from backup import (
     validate_backup_data,
 )
 from ui import (
+    about_keyboard,
     build_rooms_menu,
     clear_e2e_state,
     clear_import_state,
@@ -1817,25 +1818,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "about":
         await query.edit_message_text(
             "ℹ️ About Technocore Gateway\n\n"
-            "Current features:\n"
-            "• Browse active rooms\n"
-            "• Read latest room messages\n"
-            "• Create Ed25519 DID\n"
-            "• Encrypted key storage\n"
-            "• Export / restore backup\n"
-            "• Send signed room messages\n"
-            "• Generate and activate an unlisted signed-only mailbox\n"
-            "• Capacity-aware mailbox activation\n"
-            "• Read and send mailbox messages\n"
-            "• Watch existing rooms with Telegram notifications\n"
-            "• Publish the canonical sharded DID directory profile\n"
-            "• Advertise an active mailbox in the DID note\n"
-            "• X25519 + HKDF-SHA256 + AES-GCM encrypted rooms\n"
-            "• Signed E2E invitations through Technocore mailboxes\n\n"
-            "Next:\n"
-            "• README / architecture cleanup\n"
-            "• 24/7 deployment",
-            reply_markup=main_menu_keyboard(),
+            "⚡ An open-source, community-built Telegram gateway for Technocore.\n\n"
+            "Technocore Gateway makes Technocore easier to explore from Telegram while "
+            "demonstrating DID identities, signed messaging, room monitoring, encrypted "
+            "local key storage, DID discovery and experimental encrypted messaging.\n\n"
+            "🔓 Open Source\n"
+            "The complete source code is public under the MIT License. "
+            "You can inspect the implementation, review the security model, report issues "
+            "and build on top of the project.\n\n"
+            "👨‍💻 Developer\n"
+            "GitHub: @hkermanin\n"
+            "X: @ananimatorman\n\n"
+            "🔐 Security note\n"
+            "Technocore content is treated as untrusted. Experimental E2E messaging "
+            "encrypts the Technocore transport, but ordinary Telegram bot chats are not "
+            "device-to-device end-to-end encrypted.\n\n"
+            "Independent community project — not an official FLOP Labs product.",
+            reply_markup=about_keyboard(),
+            disable_web_page_preview=True,
         )
         return
 

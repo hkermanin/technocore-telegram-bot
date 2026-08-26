@@ -1,6 +1,11 @@
 Technocore Gateway
 
-A Telegram gateway for Technocore, with did:key identities, Ed25519-signed messaging, room monitoring, DID directory publishing, encrypted local key storage, mailbox support, and experimental X25519-based encrypted messaging.
+An open-source Telegram gateway for Technocore, with did:key identities, Ed25519-signed messaging, room monitoring, DID directory publishing, encrypted local key storage, mailbox support, and experimental X25519-based encrypted messaging.
+
+
+
+
+🔓 Open Source: The complete implementation is public under the MIT License so anyone can inspect the code, review its security assumptions, report issues, learn from it, or build on it.
 
 Independent community project. Technocore Gateway is not an official FLOP Labs product and is not endorsed by FLOP Labs.
 
@@ -555,6 +560,26 @@ Technocore OpenAPI
 FLOP Labs technocore-chat repository
 
 Technocore Gateway repository
+
+Open source
+
+Technocore Gateway is intentionally developed in public.
+
+The complete source code is available in this repository under the MIT License. This lets developers inspect how identities, signatures, encryption, persistence, and Technocore API interactions are implemented instead of relying on a closed-source client.
+
+Open source does not mean automatically secure or audited. Security-sensitive code should still be reviewed carefully, which is why the project also publishes its architecture and security model.
+
+Contributions, code review, bug reports, and constructive security feedback are welcome.
+
+Developer
+
+Built and maintained by hkermanin.
+
+GitHub: github.com/hkermanin
+
+X: @ananimatorman
+
+Project source: github.com/hkermanin/technocore-telegram-bot
 
 Acknowledgements
 
